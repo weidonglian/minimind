@@ -1,0 +1,213 @@
+# =============================================================================
+# MiniMind — Taskfile (https://taskfile.dev, `go-task`)
+#
+# The whole MiniMind pipeline as short runnable commands:
+#
+#   download-dataset ─▶ pretrain ─▶ full-sft ─▶┬─ chat          (try the model)
+#                                              ├─ lora / distill (more SFT)
+#                                              ├─ dpo / ppo / grpo / agent (alignment & RL)
+#                                              └─ convert ─▶ serve / web (deployment)
+#
+# Examples:
+#   task                            # show all tasks + descriptions
+#   task env                        # create .venv with uv + install deps (incl. CUDA torch)
+#   task zero                       # one-shot: download mini data -> pretrain -> SFT
+#   task pretrain                   # run one stage (defaults tuned for this machine)
+#   task pretrain -- --epochs 1     # args after `--` go straight to the python script
+#   task pretrain -- --from_resume 1                       # resume from checkpoint
+#   task pretrain PRETRAIN_ARGS="--batch_size 32"           # replace tuned defaults
+#
+# Artifacts: weights -> ./out (out/pretrain_768.pth, out/full_sft_768.pth, ...)
+#            resume checkpoints -> ./checkpoints
+#            datasets -> ./dataset
+# =============================================================================
+
+version: '3'
+
+vars:
+  # repo root (this Task's version has no .ROOT_DIR special var, hence absolute)
+  ROOT: /home/weidong/develop/minimind
+  # python env: uv-managed venv in the repo root (see `task env`)
+  BIN: '{{.ROOT}}/.venv/bin'
+  PY: '{{.BIN}}/python'
+  # Launcher for all training scripts.
+  RUN: '{{.PY}}'
+  # Dataset/weight source: modelscope (faster in CN) or hf
+  SOURCE: modelscope
+  DATASET_REPO_MS: gongjy/minimind_dataset
+  DATASET_REPO_HF: jingyaogong/minimind_dataset
+  # The *_mini pair is enough to reproduce the "MiniMind Zero" chat model.
+  # Other useful files: rlaif.jsonl dpo.jsonl agent_rl.jsonl agent_rl_math.jsonl lora_medical.jsonl
+  DATASET_FILES: pretrain_t2t_mini.jsonl sft_t2t_mini.jsonl
+  # ---------------------------------------------------------------------------
+  # Tuned for this machine: 1x RTX 5070 Ti 16GB (~15.5GB visible, desktop session
+  # takes ~0.7GB), 32-core CPU. Model: default 768x8 = 63.9M params.
+  # MEASURED (bf16 autocast + AdamW, replicating train_pretrain.py):
+  #   seq 768: batch 24 -> 9.1 GiB peak | batch 32 -> 11.9 GiB | batch 48 -> OOM
+  # So: max_seq_len 768 (README-recommended truncation for pretrain_t2t_mini.jsonl),
+  # batch 32 x accum 8 = effective 256 (same as upstream default), ~2.7 GiB headroom.
+  # num_workers 12 of 32 cores for on-the-fly tokenization.
+  PRETRAIN_ARGS: '--batch_size 32 --accumulation_steps 8 --max_seq_len 768 --num_workers 12'
+
+tasks:
+  default:
+    desc: Show the task overview (this list)
+    silent: true
+    cmds:
+      - task --list
+
+  env:
+    desc: Create .venv with uv (python 3.12) and install all deps incl. CUDA torch
+    cmds:
+      # uv-managed python 3.12 (not 3.13: pinned deps like sentencepiece 0.2.0 have
+      # no cp313 wheels; not system 3.12: ujson 5.1.0 must build from source and the
+      # system python lacks Python.h dev headers). Downloads once into ~/.local/share/uv.
+      - uv venv --python 3.12 --python-preference only-managed --clear {{.ROOT}}/.venv
+      # torch is commented out in requirements.txt but arrives as a dependency of
+      # trl (latest CUDA build, works on the RTX 5070 Ti / Blackwell sm_120);
+      # fallback if GPU is ever unavailable:
+      #   uv pip install torch --index-url https://download.pytorch.org/whl/cu128 -p {{.BIN}}/python
+      - uv pip install -r {{.ROOT}}/requirements.txt -p {{.BIN}}/python
+      - |
+        {{.PY}} - <<'EOF'
+        import torch
+        print('torch', torch.__version__, '| cuda available:', torch.cuda.is_available())
+        print('gpu:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NONE - fix the torch install before training')
+        EOF
+
+  # ------------------------------------------------------------------ data --
+  download-dataset:
+    desc: Download datasets into ./dataset (mini pair by default; FULL=1 for mainline)
+    cmds:
+      - |
+        mkdir -p dataset
+        FILES='{{if .FILES}}{{.FILES}}{{else if .FULL}}pretrain_t2t.jsonl sft_t2t.jsonl{{else}}{{.DATASET_FILES}}{{end}}'
+        for f in $FILES; do
+          if [ -f "dataset/$f" ]; then echo "-> skip $f (already exists)"; continue; fi
+          echo "-> downloading $f"
+          if [ "{{.SOURCE}}" = "hf" ]; then
+            huggingface-cli download {{.DATASET_REPO_HF}} "$f" --repo-type dataset --local-dir dataset
+          else
+            modelscope download --dataset {{.DATASET_REPO_MS}} "$f" --local_dir dataset
+          fi
+        done
+
+  download-model:
+    desc: Download the author's trained .pth weights into ./out (skip training entirely)
+    cmds:
+      - |
+        mkdir -p out
+        if [ "{{.SOURCE}}" = "hf" ]; then
+          huggingface-cli download jingyaogong/minimind-3-pytorch --local-dir out
+        else
+          modelscope download --model gongjy/minimind-3-pytorch --local_dir out
+        fi
+
+  download-reward:
+    desc: Download InternLM2-1.8B reward model to ../internlm2-1_8b-reward (needed by ppo/grpo/agent)
+    cmds:
+      - |
+        if [ "{{.SOURCE}}" = "hf" ]; then
+          huggingface-cli download internlm/internlm2-1_8b-reward --local-dir ../internlm2-1_8b-reward
+        else
+          modelscope download --model Shanghai_AI_Laboratory/internlm2-1_8b-reward --local_dir ../internlm2-1_8b-reward
+        fi
+
+  # --------------------------------------------------------------- pipeline --
+  zero:
+    desc: One-shot MiniMind Zero — download mini datasets, pretrain, then SFT
+    cmds:
+      - task: download-dataset
+      - task: pretrain
+      - task: full-sft
+      - 'echo "Done. Chat with it: task chat"'
+
+  tokenizer:
+    desc: '[optional] Train the BPE tokenizer (repo already ships one; for learning only)'
+    dir: trainer
+    cmds:
+      - '{{.RUN}} train_tokenizer.py {{.CLI_ARGS}}'
+
+  pretrain:
+    desc: 'Stage 1 (required): next-token pretraining -> out/pretrain_768.pth (defaults tuned for local 5070 Ti 16G)'
+    dir: trainer
+    cmds:
+      # expandable_segments: reduces fragmentation risk across long runs / checkpoint saves
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True {{.RUN}} train_pretrain.py {{.PRETRAIN_ARGS}} {{.CLI_ARGS}}
+
+  full-sft:
+    desc: 'Stage 2 (required): instruction/chat SFT on sft data (from pretrain) -> out/full_sft_768.pth'
+    dir: trainer
+    cmds:
+      - '{{.RUN}} train_full_sft.py {{.CLI_ARGS}}'
+
+  chat:
+    desc: 'Terminal chat with a trained .pth weight (default full_sft; override: `task chat -- --weight pretrain`)'
+    cmds:
+      - '{{.PY}} eval_llm.py --weight full_sft {{.CLI_ARGS}}'
+
+  # ------------------------------------------------- more SFT / alignment/RL --
+  lora:
+    desc: LoRA finetune on lora_medical.jsonl (from full_sft) -> out/lora_medical_768.pth
+    dir: trainer
+    cmds:
+      - '{{.RUN}} train_lora.py {{.CLI_ARGS}}'
+
+  distill:
+    desc: Teacher->student distillation (from full_sft weights) -> out/full_dist_768.pth
+    dir: trainer
+    cmds:
+      - '{{.RUN}} train_distillation.py {{.CLI_ARGS}}'
+
+  dpo:
+    desc: DPO preference alignment on dpo.jsonl (from full_sft) -> out/dpo_768.pth
+    dir: trainer
+    cmds:
+      - '{{.RUN}} train_dpo.py {{.CLI_ARGS}}'
+
+  ppo:
+    desc: PPO RLHF on rlaif.jsonl (needs download-reward) -> out/ppo_actor_768.pth
+    dir: trainer
+    cmds:
+      - '{{.RUN}} train_ppo.py {{.CLI_ARGS}}'
+
+  grpo:
+    desc: GRPO/CISPO RL on rlaif.jsonl (needs download-reward) -> out/grpo_768.pth
+    dir: trainer
+    cmds:
+      - '{{.RUN}} train_grpo.py {{.CLI_ARGS}}'
+
+  agent:
+    desc: Agentic RL — multi-turn tool-use GRPO/CISPO on agent_rl.jsonl -> out/agent_768.pth
+    dir: trainer
+    cmds:
+      - '{{.RUN}} train_agent.py {{.CLI_ARGS}}'
+
+  # ------------------------------------------------------------ eval & deploy --
+  eval-toolcall:
+    desc: Tool-call benchmark against a local weight or an OpenAI-compatible API
+    dir: scripts
+    cmds:
+      - '{{.PY}} eval_toolcall.py {{.CLI_ARGS}}'
+
+  convert:
+    desc: Convert out/full_sft_768.pth to transformers (Qwen3-compatible) format in ../minimind-3
+    dir: scripts
+    cmds:
+      - '{{.PY}} convert_model.py {{.CLI_ARGS}}'
+
+  serve:
+    desc: OpenAI-compatible chat API (completions + tool calls) on http://localhost:8998
+    dir: scripts
+    cmds:
+      - '{{.PY}} serve_openai_api.py {{.CLI_ARGS}}'
+
+  web:
+    desc: Streamlit web chat UI (finds transformers-format models under scripts/)
+    cmds:
+      - '{{.BIN}}/streamlit run scripts/web_demo.py'
+
+  clean:
+    desc: Delete ./out (weights) and ./checkpoints (resume state)
+    cmds:
+      - rm -rf out checkpoints
