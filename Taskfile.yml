@@ -24,6 +24,12 @@
 
 version: '3'
 
+env:
+  # train_* scripts log via print(); without this their output is block-buffered
+  # when piped/redirected and appears only in big delayed bursts
+  PYTHONUNBUFFERED:
+    '1'
+
 vars:
   # repo root (this Task's version has no .ROOT_DIR special var, hence absolute)
   ROOT: /home/weidong/develop/minimind
@@ -32,8 +38,8 @@ vars:
   PY: '{{.BIN}}/python'
   # Launcher for all training scripts.
   RUN: '{{.PY}}'
-  # Dataset/weight source: modelscope (faster in CN) or hf
-  SOURCE: modelscope
+  # Dataset/weight source: hf (default; both work from this network) or modelscope (faster in CN)
+  SOURCE: hf
   DATASET_REPO_MS: gongjy/minimind_dataset
   DATASET_REPO_HF: jingyaogong/minimind_dataset
   # The *_mini pair is enough to reproduce the "MiniMind Zero" chat model.
@@ -67,7 +73,9 @@ tasks:
       # trl (latest CUDA build, works on the RTX 5070 Ti / Blackwell sm_120);
       # fallback if GPU is ever unavailable:
       #   uv pip install torch --index-url https://download.pytorch.org/whl/cu128 -p {{.BIN}}/python
-      - uv pip install -r {{.ROOT}}/requirements.txt -p {{.BIN}}/python
+      # pyarrow pin: requirements.txt pins numpy==1.26.4, but unpinned pyarrow (>=21)
+      # requires numpy>=2 — pin it to the last numpy-1.x compatible line
+      - uv pip install -r {{.ROOT}}/requirements.txt 'pyarrow==20.0.0' -p {{.BIN}}/python
       - |
         {{.PY}} - <<'EOF'
         import torch
@@ -86,9 +94,9 @@ tasks:
           if [ -f "dataset/$f" ]; then echo "-> skip $f (already exists)"; continue; fi
           echo "-> downloading $f"
           if [ "{{.SOURCE}}" = "hf" ]; then
-            huggingface-cli download {{.DATASET_REPO_HF}} "$f" --repo-type dataset --local-dir dataset
+            {{.BIN}}/hf download {{.DATASET_REPO_HF}} "$f" --repo-type dataset --local-dir dataset
           else
-            modelscope download --dataset {{.DATASET_REPO_MS}} "$f" --local_dir dataset
+            {{.BIN}}/modelscope download --dataset {{.DATASET_REPO_MS}} "$f" --local_dir dataset
           fi
         done
 
@@ -98,9 +106,9 @@ tasks:
       - |
         mkdir -p out
         if [ "{{.SOURCE}}" = "hf" ]; then
-          huggingface-cli download jingyaogong/minimind-3-pytorch --local-dir out
+          {{.BIN}}/hf download jingyaogong/minimind-3-pytorch --local-dir out
         else
-          modelscope download --model gongjy/minimind-3-pytorch --local_dir out
+          {{.BIN}}/modelscope download --model gongjy/minimind-3-pytorch --local_dir out
         fi
 
   download-reward:
@@ -108,9 +116,9 @@ tasks:
     cmds:
       - |
         if [ "{{.SOURCE}}" = "hf" ]; then
-          huggingface-cli download internlm/internlm2-1_8b-reward --local-dir ../internlm2-1_8b-reward
+          {{.BIN}}/hf download internlm/internlm2-1_8b-reward --local-dir ../internlm2-1_8b-reward
         else
-          modelscope download --model Shanghai_AI_Laboratory/internlm2-1_8b-reward --local_dir ../internlm2-1_8b-reward
+          {{.BIN}}/modelscope download --model Shanghai_AI_Laboratory/internlm2-1_8b-reward --local_dir ../internlm2-1_8b-reward
         fi
 
   # --------------------------------------------------------------- pipeline --

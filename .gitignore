@@ -3,5 +3,7 @@ __pycache__/
 .DS_Store
 .venv
 out
+checkpoints/
+dataset/*.jsonl
 website/
 docs-minimind/
